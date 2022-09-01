@@ -94,6 +94,9 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
             let canWrite = s.canSend
             s.mutex.signal()
             if !canWrite {
+                if case .connectionClose = opcode {
+                    completion?()
+                }
                 return
             }
             
