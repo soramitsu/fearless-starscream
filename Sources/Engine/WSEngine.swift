@@ -9,7 +9,7 @@
 import Foundation
 
 public class WSEngine: Engine, TransportEventClient, FramerEventClient,
-FrameCollectorDelegate, HTTPHandlerDelegate {
+                       FrameCollectorDelegate, HTTPHandlerDelegate {
     private let transport: Transport
     private let framer: Framer
     private let httpHandler: HTTPHandler
@@ -24,6 +24,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     private let writeQueue = DispatchQueue(label: "com.vluxe.starscream.writequeue")
     private let mutex = DispatchSemaphore(value: 1)
     private var canSend = false
+    private var isConnecting = false
     
     weak var delegate: EngineDelegate?
     public var respondToPingWithPong: Bool = true
@@ -52,7 +53,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
         mutex.wait()
         let isConnected = canSend
         mutex.signal()
-        if isConnected {
+        if isConnecting || isConnected {
             return
         }
         
@@ -64,6 +65,10 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
         guard let url = request.url else {
             return
         }
+        
+        mutex.wait()
+        self.isConnecting = true
+        mutex.signal()
         transport.connect(url: url, timeout: request.timeoutInterval, certificatePinning: certPinner)
     }
     
@@ -79,6 +84,9 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     }
     
     public func forceStop() {
+        mutex.wait()
+        isConnecting = false
+        mutex.signal()
         transport.disconnect()
     }
     
@@ -94,9 +102,6 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
             let canWrite = s.canSend
             s.mutex.signal()
             if !canWrite {
-                if case .connectionClose = opcode {
-                    completion?()
-                }
                 return
             }
             
@@ -142,6 +147,9 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                 }
             }
         case .cancelled:
+            mutex.wait()
+            isConnecting = false
+            mutex.signal()
             broadcast(event: .cancelled)
         }
     }
@@ -156,6 +164,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                 return
             }
             mutex.wait()
+            isConnecting = false
             didUpgrade = true
             canSend = true
             mutex.signal()
@@ -165,7 +174,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                     HTTPCookieStorage.shared.setCookie($0)
                 }
             }
-
+            
             broadcast(event: .connected(headers))
         case .failure(let error):
             handleError(error)
@@ -228,6 +237,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     
     private func reset() {
         mutex.wait()
+        isConnecting = false
         canSend = false
         didUpgrade = false
         mutex.signal()
