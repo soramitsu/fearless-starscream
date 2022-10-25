@@ -229,7 +229,9 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
         if let wsError = error as? WSError {
             stop(closeCode: wsError.code)
         } else {
+            mutex.wait()
             stop()
+            mutex.signal()
         }
         
         delegate?.didReceive(event: .error(error))
