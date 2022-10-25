@@ -85,9 +85,9 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
     
     public func forceStop() {
         mutex.wait()
+        transport.disconnect()
         isConnecting = false
         mutex.signal()
-        transport.disconnect()
     }
     
     public func write(string: String, completion: (() -> ())?) {
