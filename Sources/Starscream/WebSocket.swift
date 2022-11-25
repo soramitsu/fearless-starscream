@@ -42,6 +42,7 @@ public struct WSError: Error {
 }
 
 public protocol WebSocketClient: AnyObject {
+    var engine: Engine { get }
     func connect()
     func disconnect(closeCode: UInt16)
     func write(string: String, completion: (() -> ())?)
@@ -92,7 +93,7 @@ public protocol WebSocketDelegate: AnyObject {
 }
 
 open class WebSocket: WebSocketClient, EngineDelegate {
-    private let engine: Engine
+    public let engine: Engine
     public weak var delegate: WebSocketDelegate?
     public var onEvent: ((WebSocketEvent) -> Void)?
     

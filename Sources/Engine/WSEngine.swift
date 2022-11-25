@@ -9,7 +9,7 @@
 import Foundation
 
 public class WSEngine: Engine, TransportEventClient, FramerEventClient,
-                       FrameCollectorDelegate, HTTPHandlerDelegate {
+FrameCollectorDelegate, HTTPHandlerDelegate {
     private let transport: Transport
     private let framer: Framer
     private let httpHandler: HTTPHandler
@@ -24,7 +24,6 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
     private let writeQueue = DispatchQueue(label: "com.vluxe.starscream.writequeue")
     private let mutex = DispatchSemaphore(value: 1)
     private var canSend = false
-    private var isConnecting = false
     
     weak var delegate: EngineDelegate?
     public var respondToPingWithPong: Bool = true
@@ -53,7 +52,7 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
         mutex.wait()
         let isConnected = canSend
         mutex.signal()
-        if isConnecting || isConnected {
+        if isConnected {
             return
         }
         
@@ -65,10 +64,6 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
         guard let url = request.url else {
             return
         }
-        
-        mutex.wait()
-        self.isConnecting = true
-        mutex.signal()
         transport.connect(url: url, timeout: request.timeoutInterval, certificatePinning: certPinner)
     }
     
@@ -84,10 +79,7 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
     }
     
     public func forceStop() {
-        mutex.wait()
         transport.disconnect()
-        isConnecting = false
-        mutex.signal()
     }
     
     public func write(string: String, completion: (() -> ())?) {
@@ -147,9 +139,6 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
                 }
             }
         case .cancelled:
-            mutex.wait()
-            isConnecting = false
-            mutex.signal()
             broadcast(event: .cancelled)
         }
     }
@@ -164,7 +153,6 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
                 return
             }
             mutex.wait()
-            isConnecting = false
             didUpgrade = true
             canSend = true
             mutex.signal()
@@ -174,7 +162,7 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
                     HTTPCookieStorage.shared.setCookie($0)
                 }
             }
-            
+
             broadcast(event: .connected(headers))
         case .failure(let error):
             handleError(error)
@@ -229,9 +217,7 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
         if let wsError = error as? WSError {
             stop(closeCode: wsError.code)
         } else {
-            mutex.wait()
             stop()
-            mutex.signal()
         }
         
         delegate?.didReceive(event: .error(error))
@@ -239,7 +225,6 @@ public class WSEngine: Engine, TransportEventClient, FramerEventClient,
     
     private func reset() {
         mutex.wait()
-        isConnecting = false
         canSend = false
         didUpgrade = false
         mutex.signal()
