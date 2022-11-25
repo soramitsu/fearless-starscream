@@ -31,7 +31,6 @@ public enum FoundationTransportError: Error {
 public class FoundationTransport: NSObject, Transport, StreamDelegate {
     private weak var delegate: TransportEventClient?
     private let workQueue = DispatchQueue(label: "com.vluxe.starscream.websocket", attributes: [])
-    private let mutex = DispatchSemaphore(value: 1)
     private var inputStream: InputStream?
     private var outputStream: OutputStream?
     private var isOpen = false
@@ -96,12 +95,6 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
     }
     
     public func disconnect() {
-        mutex.wait()
-        
-        defer {
-            mutex.signal()
-        }
-        
         if let stream = inputStream {
             stream.delegate = nil
             CFReadStreamSetDispatchQueue(stream, nil)
