@@ -66,12 +66,13 @@ public class TCPTransport: Transport {
                     sec_protocol_verify_complete(true)
                     return
                 }
-                pinner.evaluateTrust(trust: trust, domain: parts.host, completion: { (state) in
+                pinner.evaluateTrust(trust: trust, domain: parts.host, completion: { [weak self] (state) in
                     switch state {
                     case .success:
                         sec_protocol_verify_complete(true)
-                    case .failed(_):
+                    case .failed(let error):
                         sec_protocol_verify_complete(false)
+                        self?.delegate?.connectionChanged(state: .failed(error))
                     }
                 })
             }, queue)
