@@ -112,10 +112,10 @@ public class TCPTransport: Transport {
                      if (errorCode == .ETIMEDOUT) {
                          self?.delegate?.connectionChanged(state: .timeout)
                      } else {
-                         self?.delegate?.connectionChanged(state: .waiting)
+                         self?.delegate?.connectionChanged(state: .failed(error))
                      }
                  default:
-                     self?.delegate?.connectionChanged(state: .waiting)
+                     self?.delegate?.connectionChanged(state: .failed(error))
                  }
             case .cancelled:
                 self?.delegate?.connectionChanged(state: .cancelled)
