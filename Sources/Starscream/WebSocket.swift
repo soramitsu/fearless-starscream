@@ -87,6 +87,7 @@ public enum WebSocketEvent {
     case reconnectSuggested(Bool)
     case cancelled
     case timeout
+    case waiting(error: Error)
 }
 
 public protocol WebSocketDelegate: AnyObject {
