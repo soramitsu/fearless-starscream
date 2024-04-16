@@ -86,6 +86,7 @@ public enum WebSocketEvent {
     case viabilityChanged(Bool)
     case reconnectSuggested(Bool)
     case cancelled
+    case timeout
 }
 
 public protocol WebSocketDelegate: AnyObject {

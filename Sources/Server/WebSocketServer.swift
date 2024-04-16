@@ -138,6 +138,8 @@ public class ServerConnection: Connection, HTTPServerDelegate, FramerEventClient
         case .cancelled:
             print("server connection cancelled!")
             //broadcast(event: .cancelled)
+        case .timeout:
+            break
         }
     }
     
