@@ -24,6 +24,11 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     private let writeQueue = DispatchQueue(label: "com.vluxe.starscream.writequeue")
     private let mutex = DispatchSemaphore(value: 1)
     private var canSend = false
+    private var authorizedConnectionEpoch = UUID()
+    private var authorizedCanSend = false
+    private let authorizedWritesLock = NSLock()
+    private var authorizedWritesStopped = true
+    private var authorizedWrites = [UUID: AuthorizedWrite]()
     
     weak var delegate: EngineDelegate?
     public var respondToPingWithPong: Bool = true
@@ -68,6 +73,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     }
     
     public func stop(closeCode: UInt16 = CloseCode.normal.rawValue) {
+        invalidateAuthorizedWrites()
         let capacity = MemoryLayout<UInt16>.size
         var pointer = [UInt8](repeating: 0, count: capacity)
         writeUint16(&pointer, offset: 0, value: closeCode)
@@ -79,6 +85,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     }
     
     public func forceStop() {
+        invalidateAuthorizedWrites()
         transport.disconnect()
     }
     
@@ -110,6 +117,90 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
             })
         }
     }
+
+    /// A single write checked after frame preparation, immediately before the
+    /// transport accepts bytes. This never resends on another connection.
+    @discardableResult
+    public func writeAuthorized(data: Data, opcode: FrameOpCode,
+                                authorization: WebSocketWriteAuthorizing,
+                                callbackQueue: DispatchQueue = .main,
+                                completion: @escaping (Result<Void, Error>) -> Void) -> AuthorizedWrite {
+        let id = UUID()
+        let operation = AuthorizedWrite(callbackQueue: callbackQueue) { [weak self] result in
+            if let engine = self {
+                engine.authorizedWritesLock.lock()
+                engine.authorizedWrites.removeValue(forKey: id)
+                engine.authorizedWritesLock.unlock()
+            }
+            completion(result)
+        }
+        // Preparing a stateful compressed frame and then denying it would
+        // desynchronize the compressor from the peer. Wallet RPC connections
+        // use no compression; other configurations are not qualified here.
+        guard compressionHandler == nil else {
+            operation.complete(.failure(AuthorizedWriteError.unsupportedCompression))
+            return operation
+        }
+        guard let transport = transport as? AuthorizedTransport else {
+            operation.complete(.failure(AuthorizedWriteError.unsupportedTransport))
+            return operation
+        }
+        authorizedWritesLock.lock()
+        let stopped = authorizedWritesStopped
+        if !stopped { authorizedWrites[id] = operation }
+        authorizedWritesLock.unlock()
+        guard !stopped else {
+            operation.complete(.failure(AuthorizedWriteError.connectionChanged))
+            return operation
+        }
+        mutex.wait()
+        let epoch = authorizedConnectionEpoch
+        let connected = canSend && authorizedCanSend
+        mutex.signal()
+        guard connected, let context = transport.captureWriteContext() else {
+            operation.complete(.failure(AuthorizedWriteError.connectionChanged))
+            return operation
+        }
+        writeQueue.async { [weak self] in
+            guard let engine = self else {
+                operation.complete(.failure(AuthorizedWriteError.connectionChanged))
+                return
+            }
+            let frame = engine.framer.createWriteFrame(opcode: opcode, payload: data, isCompressed: false)
+            engine.mutex.wait()
+            do {
+                defer { engine.mutex.signal() }
+                guard engine.canSend, engine.authorizedCanSend, engine.authorizedConnectionEpoch == epoch else {
+                    throw AuthorizedWriteError.connectionChanged
+                }
+                try transport.write(data: frame, context: context, operation: operation, authorization: authorization) { error in
+                    // Even an inline transport completion cannot run a caller
+                    // under the application authority or engine/state locks.
+                    engine.writeQueue.async {
+                        operation.complete(error.map { .failure($0) } ?? .success(()))
+                    }
+                }
+            } catch {
+                operation.complete(.failure(error))
+            }
+        }
+        return operation
+    }
+
+    private func invalidateAuthorizedWrites() {
+        // Cancel even an already-dequeued operation waiting for application
+        // authority, before waiting for the engine's writer critical section.
+        authorizedWritesLock.lock()
+        authorizedWritesStopped = true
+        let pending = Array(authorizedWrites.values)
+        authorizedWrites.removeAll()
+        authorizedWritesLock.unlock()
+        for operation in pending { operation.cancel() }
+        mutex.wait()
+        authorizedConnectionEpoch = UUID()
+        authorizedCanSend = false
+        mutex.signal()
+    }
     
     // MARK: - TransportEventClient
     
@@ -121,6 +212,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
             let data = httpHandler.convert(request: wsReq)
             transport.write(data: data, completion: {_ in })
         case let .waiting(error):
+            invalidateAuthorizedWrites()
             broadcast(event: .waiting(error: error))
         case .failed(let error):
             handleError(error)
@@ -139,8 +231,10 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                 }
             }
         case .cancelled:
+            invalidateAuthorizedWrites()
             broadcast(event: .cancelled)
         case .timeout:
+            invalidateAuthorizedWrites()
             broadcast(event: .timeout)
         }
     }
@@ -154,7 +248,13 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                 handleError(error)
                 return
             }
+            invalidateAuthorizedWrites()
             mutex.wait()
+            authorizedConnectionEpoch = UUID()
+            authorizedCanSend = true
+            authorizedWritesLock.lock()
+            authorizedWritesStopped = false
+            authorizedWritesLock.unlock()
             didUpgrade = true
             canSend = true
             mutex.signal()
@@ -227,6 +327,8 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     
     private func reset() {
         mutex.wait()
+        authorizedConnectionEpoch = UUID()
+        authorizedCanSend = false
         canSend = false
         didUpgrade = false
         mutex.signal()

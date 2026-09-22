@@ -1,0 +1,26 @@
+name: Authorized transport source
+on:
+  pull_request:
+  push:
+    branches:
+      - codex/authorized-transport-write
+permissions:
+  contents: read
+jobs:
+  authorized-write:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Exercise queue cancellation, expiry and real local TCP handoff
+        run: python3 scripts/test-authorized-write.py
+      - name: Compile the iOS framework at the wallet's existing minimum
+        run: >-
+          xcodebuild -project Starscream.xcodeproj -scheme Starscream
+          -configuration Release -destination 'generic/platform=iOS'
+          -derivedDataPath build/DerivedData-authorized-write
+          CODE_SIGNING_ALLOWED=NO IPHONEOS_DEPLOYMENT_TARGET=15.0 build
+      - name: Reject source mutation by build tools
+        run: git diff --exit-code

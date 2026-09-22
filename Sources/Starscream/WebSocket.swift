@@ -54,6 +54,23 @@ public protocol WebSocketClient: AnyObject {
 
 //implements some of the base behaviors
 extension WebSocketClient {
+    /// Qualified guarded writes require WSEngine and an AuthorizedTransport.
+    /// Legacy/custom engines retain their ordinary write API and fail closed
+    /// for this new per-write authorization contract.
+    @discardableResult
+    public func write(stringData: Data, authorization: WebSocketWriteAuthorizing,
+                      callbackQueue: DispatchQueue = .main,
+                      completion: @escaping (Result<Void, Error>) -> Void) -> AuthorizedWrite {
+        guard let guardedEngine = engine as? WSEngine else {
+            let operation = AuthorizedWrite(callbackQueue: callbackQueue, completion: completion)
+            operation.complete(.failure(AuthorizedWriteError.unsupportedTransport))
+            return operation
+        }
+        return guardedEngine.writeAuthorized(data: stringData, opcode: .textFrame,
+                                             authorization: authorization, callbackQueue: callbackQueue,
+                                             completion: completion)
+    }
+
     public func write(string: String) {
         write(string: string, completion: nil)
     }

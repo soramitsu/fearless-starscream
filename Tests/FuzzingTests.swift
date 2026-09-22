@@ -66,6 +66,8 @@ class FuzzingTests: XCTestCase {
                 break
             case .cancelled:
                 break
+            case .timeout, .waiting:
+                XCTFail("Unexpected connection failure in local framing test")
             }
         }
         websocket.connect()
@@ -91,7 +93,7 @@ class FuzzingTests: XCTestCase {
                     XCTFail("text does not match: source: [\(string)] response: [\(text)]")
                 }
             case .binary(let conn, let data):
-                if payload.count == data.count && isBinary {
+                if payload == data && isBinary {
                     conn.write(data: Data(), opcode: .connectionClose)
                     return true //success!
                 } else {

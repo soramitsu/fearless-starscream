@@ -29,12 +29,19 @@ public enum TCPTransportError: Error {
 }
 
 @available(macOS 10.14, iOS 12.0, watchOS 5.0, tvOS 12.0, *)
-public class TCPTransport: Transport {
+public class TCPTransport: AuthorizedTransport {
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.vluxe.starscream.networkstream", attributes: [])
     private weak var delegate: TransportEventClient?
     private var isRunning = false
     private var isTLS = false
+    private let writeContextLock = NSLock()
+    private final class WriteContext {
+        let connection: NWConnection
+        init(_ connection: NWConnection) { self.connection = connection }
+    }
+    private var writeContext: WriteContext?
+    private var authorizedConnection: NWConnection?
     
     public var usingTLS: Bool {
         return self.isTLS
@@ -42,6 +49,7 @@ public class TCPTransport: Transport {
     
     public init(connection: NWConnection) {
         self.connection = connection
+        authorizedConnection = connection
         start()
     }
     
@@ -80,10 +88,18 @@ public class TCPTransport: Transport {
         let parameters = NWParameters(tls: tlsOptions, tcp: options)
         let conn = NWConnection(host: NWEndpoint.Host.name(parts.host, nil), port: NWEndpoint.Port(rawValue: UInt16(parts.port))!, using: parameters)
         connection = conn
+        writeContextLock.lock()
+        authorizedConnection = conn
+        writeContext = nil
+        writeContextLock.unlock()
         start()
     }
     
     public func disconnect() {
+        writeContextLock.lock()
+        writeContext = nil
+        authorizedConnection = nil
+        writeContextLock.unlock()
         isRunning = false
         connection?.cancel()
     }
@@ -97,6 +113,34 @@ public class TCPTransport: Transport {
             completion(error)
         })
     }
+
+    internal func captureWriteContext() -> AnyObject? {
+        writeContextLock.lock()
+        defer { writeContextLock.unlock() }
+        guard let context = writeContext, case .ready = context.connection.state else { return nil }
+        return context
+    }
+
+    internal func write(data: Data, context: AnyObject, operation: AuthorizedWrite,
+                        authorization: WebSocketWriteAuthorizing, completion: @escaping (Error?) -> Void) throws {
+        writeContextLock.lock()
+        defer { writeContextLock.unlock() }
+        guard let current = writeContext, current === context,
+              case .ready = current.connection.state else {
+            throw AuthorizedWriteError.connectionChanged
+        }
+        // Lock waits and connection validation precede the final authority
+        // clock sample. There is no library queue/serialization after it.
+        operation.perform(authorization: authorization) {
+            current.connection.send(content: data, completion: .contentProcessed(completion))
+        }
+    }
+
+    private func invalidateWriteContext(for connection: NWConnection) {
+        writeContextLock.lock()
+        if writeContext?.connection === connection { writeContext = nil }
+        writeContextLock.unlock()
+    }
     
     private func start() {
         guard let conn = connection else {
@@ -105,8 +149,14 @@ public class TCPTransport: Transport {
         conn.stateUpdateHandler = { [weak self] (newState) in
             switch newState {
             case .ready:
+                if let transport = self {
+                    transport.writeContextLock.lock()
+                    if transport.authorizedConnection === conn { transport.writeContext = WriteContext(conn) }
+                    transport.writeContextLock.unlock()
+                }
                 self?.delegate?.connectionChanged(state: .connected)
             case let .waiting(error):
+                self?.invalidateWriteContext(for: conn)
                 switch error {
                  case .posix(let errorCode):
                      if (errorCode == .ETIMEDOUT) {
@@ -118,8 +168,10 @@ public class TCPTransport: Transport {
                     self?.delegate?.connectionChanged(state: .waiting(error: error))
                  }
             case .cancelled:
+                self?.invalidateWriteContext(for: conn)
                 self?.delegate?.connectionChanged(state: .cancelled)
             case .failed(let error):
+                self?.invalidateWriteContext(for: conn)
                 self?.delegate?.connectionChanged(state: .failed(error))
             case .setup, .preparing:
                 break

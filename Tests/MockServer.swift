@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import CommonCrypto
 @testable import Starscream
 
 public class MockConnection: Connection, HTTPServerDelegate, FramerEventClient, FrameCollectorDelegate {
@@ -44,8 +45,17 @@ public class MockConnection: Connection, HTTPServerDelegate, FramerEventClient, 
         switch event {
         case .success(let headers):
             didUpgrade = true
-            //TODO: add headers and key check?
-            let response = httpHandler.createResponse(headers: [:])
+            guard let key = headers.first(where: { $0.key.caseInsensitiveCompare("Sec-WebSocket-Key") == .orderedSame })?.value else {
+                onEvent?(.error(HTTPUpgradeError.invalidData))
+                return
+            }
+            let input = Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8)
+            var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+            input.withUnsafeBytes { _ = CC_SHA1($0.baseAddress, CC_LONG(input.count), &digest) }
+            let response = httpHandler.createResponse(headers: [
+                "Upgrade": "websocket", "Connection": "Upgrade",
+                "Sec-WebSocket-Accept": Data(digest).base64EncodedString()
+            ])
             transport.received(data: response)
             delegate?.didReceive(event: .connected(self, headers))
             onEvent?(.connected(headers))
