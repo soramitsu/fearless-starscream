@@ -54,6 +54,23 @@ public protocol WebSocketClient: AnyObject {
 
 //implements some of the base behaviors
 extension WebSocketClient {
+    /// Qualified guarded writes require WSEngine and an AuthorizedTransport.
+    /// Legacy/custom engines retain their ordinary write API and fail closed
+    /// for this new per-write authorization contract.
+    @discardableResult
+    public func write(stringData: Data, authorization: WebSocketWriteAuthorizing,
+                      callbackQueue: DispatchQueue = .main,
+                      completion: @escaping (Result<Void, Error>) -> Void) -> AuthorizedWrite {
+        guard let guardedEngine = engine as? WSEngine else {
+            let operation = AuthorizedWrite(callbackQueue: callbackQueue, completion: completion)
+            operation.complete(.failure(AuthorizedWriteError.unsupportedTransport))
+            return operation
+        }
+        return guardedEngine.writeAuthorized(data: stringData, opcode: .textFrame,
+                                             authorization: authorization, callbackQueue: callbackQueue,
+                                             completion: completion)
+    }
+
     public func write(string: String) {
         write(string: string, completion: nil)
     }
@@ -94,7 +111,7 @@ public protocol WebSocketDelegate: AnyObject {
     func didReceive(event: WebSocketEvent, client: WebSocketClient)
 }
 
-open class WebSocket: WebSocketClient, EngineDelegate {
+open class WebSocket: WebSocketClient, EngineDelegate, ConnectionGenerationDelegate {
     public let engine: Engine
     public weak var delegate: WebSocketDelegate?
     public var onEvent: ((WebSocketEvent) -> Void)?
@@ -171,6 +188,21 @@ open class WebSocket: WebSocketClient, EngineDelegate {
             guard let s = self else { return }
             s.delegate?.didReceive(event: event, client: s)
             s.onEvent?(event)
+        }
+    }
+
+    internal func didReceive(event: WebSocketEvent, generation: ConnectionGeneration) {
+        let terminal: Bool
+        switch event {
+        case .disconnected, .error, .cancelled, .timeout, .waiting: terminal = true
+        default: terminal = false
+        }
+        callbackQueue.async { [weak self] in
+            // This is callback admission, not retroactive withdrawal: a
+            // delegate already executing before retirement may finish.
+            guard let socket = self, generation.allowsDelivery(isTerminal: terminal) else { return }
+            socket.delegate?.didReceive(event: event, client: socket)
+            socket.onEvent?(event)
         }
     }
 }

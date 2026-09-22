@@ -24,7 +24,7 @@ import Foundation
 #if os(watchOS)
 public typealias FoundationHTTPHandler = StringHTTPHandler
 #else
-public class FoundationHTTPHandler: HTTPHandler {
+public class FoundationHTTPHandler: HTTPHandler, ConnectionStateResetting {
 
     var buffer = Data()
     weak var delegate: HTTPHandlerDelegate?
@@ -32,6 +32,8 @@ public class FoundationHTTPHandler: HTTPHandler {
     public init() {
         
     }
+
+    internal func resetForNewConnection() { buffer = Data() }
     
     public func convert(request: URLRequest) -> Data {
         let msg = CFHTTPMessageCreateRequest(kCFAllocatorDefault, request.httpMethod! as CFString,

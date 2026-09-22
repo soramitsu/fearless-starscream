@@ -83,7 +83,7 @@ public protocol Framer {
     func supportsCompression() -> Bool
 }
 
-public class WSFramer: Framer {
+public class WSFramer: Framer, ConnectionStateResetting {
     private let queue = DispatchQueue(label: "com.vluxe.starscream.wsframer", attributes: [])
     private weak var delegate: FramerEventClient?
     private var buffer = Data()
@@ -109,7 +109,10 @@ public class WSFramer: Framer {
     }
     
     public func add(data: Data) {
-        queue.async { [weak self] in
+        // Bind queued decoding to the delegate/generation that admitted these
+        // bytes, never whichever connection registers a delegate later.
+        let delegate = self.delegate
+        queue.async { [weak self, weak delegate] in
             self?.buffer.append(data)
             while(true) {
                let event = self?.process() ?? .needsMoreData
@@ -118,19 +121,25 @@ public class WSFramer: Framer {
                     return
                 case .processedFrame(let frame, let split):
                     guard let s = self else { return }
-                    s.delegate?.frameProcessed(event: .frame(frame))
+                    delegate?.frameProcessed(event: .frame(frame))
                     if split >= s.buffer.count {
                         s.buffer = Data()
                         return
                     }
                     s.buffer = s.buffer.advanced(by: split)
                 case .failed(let error):
-                    self?.delegate?.frameProcessed(event: .error(error))
+                    delegate?.frameProcessed(event: .error(error))
                     self?.buffer = Data()
                     return
                 }
             }
         }
+    }
+
+    internal func resetForNewConnection() {
+        // Ordered after old decode jobs and before newly admitted bytes; no
+        // synchronous wait that could invert the lifecycle/decode lock order.
+        queue.async { [weak self] in self?.buffer = Data() }
     }
 
     public func register(delegate: FramerEventClient) {

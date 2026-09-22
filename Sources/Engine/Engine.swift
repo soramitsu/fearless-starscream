@@ -12,6 +12,10 @@ public protocol EngineDelegate: AnyObject {
     func didReceive(event: WebSocketEvent)
 }
 
+internal protocol ConnectionGenerationDelegate: EngineDelegate {
+    func didReceive(event: WebSocketEvent, generation: ConnectionGeneration)
+}
+
 public protocol Engine {
     func register(delegate: EngineDelegate)
     func start(request: URLRequest)

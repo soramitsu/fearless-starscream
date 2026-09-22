@@ -29,139 +29,263 @@ public enum TCPTransportError: Error {
 }
 
 @available(macOS 10.14, iOS 12.0, watchOS 5.0, tvOS 12.0, *)
-public class TCPTransport: Transport {
-    private var connection: NWConnection?
-    private let queue = DispatchQueue(label: "com.vluxe.starscream.networkstream", attributes: [])
+public class TCPTransport: AuthorizedTransport, ConnectionEventSerializing, ConnectionBoundTransport {
+    // The outer event lock serializes lifecycle and callback admission. It is
+    // deliberately distinct from the final writer context lock. Never invoke
+    // an engine/delegate while holding writeContextLock.
+    private let eventLock = NSRecursiveLock()
+    private let writeContextLock = NSLock()
+    private let queue = DispatchQueue(label: "com.vluxe.starscream.networkstream")
     private weak var delegate: TransportEventClient?
-    private var isRunning = false
-    private var isTLS = false
-    
-    public var usingTLS: Bool {
-        return self.isTLS
-    }
-    
-    public init(connection: NWConnection) {
-        self.connection = connection
-        start()
-    }
-    
-    public init() {
-        //normal connection, will use the "connect" method below
-    }
-    
-    public func connect(url: URL, timeout: Double = 10, certificatePinning: CertificatePinning? = nil) {
-        guard let parts = url.getParts() else {
-            delegate?.connectionChanged(state: .failed(TCPTransportError.invalidRequest))
-            return
-        }
-        self.isTLS = parts.isTLS
-        let options = NWProtocolTCP.Options()
-        options.connectionTimeout = Int(timeout.rounded(.up))
+    private var context: EventContext?
+    private var connection: NWConnection? // writeContextLock
+    private var isTLS = false // writeContextLock
+    private var writeContext: EventContext? // writeContextLock
 
-        let tlsOptions = isTLS ? NWProtocolTLS.Options() : nil
-        if let tlsOpts = tlsOptions {
-            sec_protocol_options_set_verify_block(tlsOpts.securityProtocolOptions, { (sec_protocol_metadata, sec_trust, sec_protocol_verify_complete) in
-                let trust = sec_trust_copy_ref(sec_trust).takeRetainedValue()
-                guard let pinner = certificatePinning else {
-                    sec_protocol_verify_complete(true)
-                    return
-                }
-                pinner.evaluateTrust(trust: trust, domain: parts.host, completion: { [weak self] (state) in
-                    switch state {
-                    case .success:
-                        sec_protocol_verify_complete(true)
-                    case .failed(let error):
-                        sec_protocol_verify_complete(false)
-                        self?.delegate?.connectionChanged(state: .failed(error))
-                    }
-                })
-            }, queue)
+    internal final class EventContext {
+        let connection: NWConnection
+        let generation: ConnectionGeneration
+        init(connection: NWConnection, generation: ConnectionGeneration) {
+            self.connection = connection
+            self.generation = generation
         }
-        let parameters = NWParameters(tls: tlsOptions, tcp: options)
-        let conn = NWConnection(host: NWEndpoint.Host.name(parts.host, nil), port: NWEndpoint.Port(rawValue: UInt16(parts.port))!, using: parameters)
-        connection = conn
-        start()
     }
-    
-    public func disconnect() {
-        isRunning = false
-        connection?.cancel()
+
+    /// Narrow source-test seam: production always calls NWConnection.receive.
+    internal var receiveOverride: ((NWConnection, @escaping (Data?, Bool, NWError?) -> Void) -> Void)?
+
+    public var usingTLS: Bool {
+        writeContextLock.lock(); defer { writeContextLock.unlock() }
+        return isTLS
     }
-    
-    public func register(delegate: TransportEventClient) {
-        self.delegate = delegate
+
+    public init(connection: NWConnection) {
+        withConnectionEvents {
+            let current = EventContext(connection: connection, generation: ConnectionGeneration())
+            install(current, tls: false)
+            start(current)
+        }
     }
-    
-    public func write(data: Data, completion: @escaping ((Error?) -> ())) {
-        connection?.send(content: data, completion: .contentProcessed { (error) in
-            completion(error)
-        })
+
+    public init() {}
+
+    internal func withConnectionEvents(_ action: () -> Void) {
+        eventLock.lock(); defer { eventLock.unlock() }
+        action()
     }
-    
-    private func start() {
-        guard let conn = connection else {
-            return
-        }
-        conn.stateUpdateHandler = { [weak self] (newState) in
-            switch newState {
-            case .ready:
-                self?.delegate?.connectionChanged(state: .connected)
-            case let .waiting(error):
-                switch error {
-                 case .posix(let errorCode):
-                     if (errorCode == .ETIMEDOUT) {
-                         self?.delegate?.connectionChanged(state: .timeout)
-                     } else {
-                         self?.delegate?.connectionChanged(state: .waiting(error: error))
-                     }
-                 default:
-                    self?.delegate?.connectionChanged(state: .waiting(error: error))
-                 }
-            case .cancelled:
-                self?.delegate?.connectionChanged(state: .cancelled)
-            case .failed(let error):
-                self?.delegate?.connectionChanged(state: .failed(error))
-            case .setup, .preparing:
-                break
-            @unknown default:
-                break
-            }
-        }
-        
-        conn.viabilityUpdateHandler = { [weak self] (isViable) in
-            self?.delegate?.connectionChanged(state: .viability(isViable))
-        }
-        
-        conn.betterPathUpdateHandler = { [weak self] (isBetter) in
-            self?.delegate?.connectionChanged(state: .shouldReconnect(isBetter))
-        }
-        
-        conn.start(queue: queue)
-        isRunning = true
-        readLoop()
-    }
-    
-    //readLoop keeps reading from the connection to get the latest content
-    private func readLoop() {
-        if !isRunning {
-            return
-        }
-        connection?.receive(minimumIncompleteLength: 2, maximumLength: 4096, completion: {[weak self] (data, context, isComplete, error) in
-            guard let s = self else {return}
-            if let data = data {
-                s.delegate?.connectionChanged(state: .receive(data))
-            }
-            
-            // Refer to https://developer.apple.com/documentation/network/implementing_netcat_with_network_framework
-            if let context = context, context.isFinal, isComplete {
+
+    public func connect(url: URL, timeout: Double = 10, certificatePinning: CertificatePinning? = nil) {
+        withConnectionEvents {
+            retireCurrent()
+            guard let parts = url.getParts(), let port = UInt16(exactly: parts.port) else {
+                delegate?.connectionChanged(state: .failed(TCPTransportError.invalidRequest))
                 return
             }
-            
-            if error == nil {
-                s.readLoop()
+            let generation = ConnectionGeneration()
+            let options = NWProtocolTCP.Options()
+            options.connectionTimeout = Int(timeout.rounded(.up))
+            let tlsOptions = parts.isTLS ? NWProtocolTLS.Options() : nil
+            if let tlsOptions = tlsOptions {
+                sec_protocol_options_set_verify_block(tlsOptions.securityProtocolOptions, { [weak self] (_, secTrust, complete) in
+                    let once = TLSCompletion(complete)
+                    guard let transport = self else { once.finish(false); return }
+                    let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
+                    guard let pinner = certificatePinning else {
+                        transport.finishVerification(.success, generation: generation, completion: once)
+                        return
+                    }
+                    pinner.evaluateTrust(trust: trust, domain: parts.host) { [weak transport] state in
+                        guard let transport = transport else { once.finish(false); return }
+                        transport.finishVerification(state, generation: generation, completion: once)
+                    }
+                }, queue)
             }
+            let parameters = NWParameters(tls: tlsOptions, tcp: options)
+            let conn = NWConnection(host: NWEndpoint.Host.name(parts.host, nil), port: NWEndpoint.Port(rawValue: port)!, using: parameters)
+            let current = EventContext(connection: conn, generation: generation)
+            install(current, tls: parts.isTLS)
+            start(current)
+        }
+    }
 
-        })
+    public func disconnect() { withConnectionEvents { retireCurrent() } }
+
+    public func register(delegate: TransportEventClient) {
+        withConnectionEvents { self.delegate = delegate }
+    }
+
+    private func install(_ current: EventContext, tls: Bool) {
+        context = current
+        writeContextLock.lock()
+        connection = current.connection
+        writeContext = nil
+        isTLS = tls
+        writeContextLock.unlock()
+    }
+
+    private func retireCurrent() {
+        let previous = context
+        previous?.generation.retire()
+        context = nil
+        writeContextLock.lock()
+        connection = nil
+        writeContext = nil
+        writeContextLock.unlock()
+        previous?.connection.cancel()
+    }
+
+    public func write(data: Data, completion: @escaping (Error?) -> Void) {
+        writeContextLock.lock()
+        let current = connection
+        writeContextLock.unlock()
+        // Legacy writes retain their API, but bind to the captured connection
+        // instead of looking up a replacement from a later completion/read.
+        current?.send(content: data, completion: .contentProcessed(completion))
+    }
+
+    internal func captureWriteContext() -> AnyObject? {
+        writeContextLock.lock(); defer { writeContextLock.unlock() }
+        guard let current = writeContext, case .ready = current.connection.state else { return nil }
+        return current
+    }
+
+    internal func writeConnectionBound(data: Data, context: AnyObject, completion: @escaping (Error?) -> Void) {
+        writeContextLock.lock()
+        guard let current = writeContext, current === context, case .ready = current.connection.state else {
+            writeContextLock.unlock()
+            completion(AuthorizedWriteError.connectionChanged)
+            return
+        }
+        current.connection.send(content: data, completion: .contentProcessed(completion))
+        writeContextLock.unlock()
+    }
+
+    internal func write(data: Data, context: AnyObject, operation: AuthorizedWrite,
+                        authorization: WebSocketWriteAuthorizing, completion: @escaping (Error?) -> Void) throws {
+        writeContextLock.lock(); defer { writeContextLock.unlock() }
+        guard let current = writeContext, current === context, case .ready = current.connection.state else {
+            throw AuthorizedWriteError.connectionChanged
+        }
+        // Unchanged physical boundary: all blocking locks precede authority.
+        // The writer never acquires eventLock or queues work after this point.
+        operation.perform(authorization: authorization) {
+            current.connection.send(content: data, completion: .contentProcessed(completion))
+        }
+    }
+
+    internal func captureEventContext() -> EventContext? {
+        eventLock.lock(); defer { eventLock.unlock() }
+        return context
+    }
+
+    private func withCurrent(_ current: EventContext, _ action: () -> Void) {
+        withConnectionEvents {
+            guard context === current, current.generation.isCurrent else { return }
+            action()
+        }
+    }
+
+    private func start(_ current: EventContext) {
+        current.connection.stateUpdateHandler = { [weak self, weak current] state in
+            guard let self = self, let current = current else { return }
+            self.handleState(state, context: current)
+        }
+        current.connection.viabilityUpdateHandler = { [weak self, weak current] viable in
+            guard let self = self, let current = current else { return }
+            self.handleEvent(.viability(viable), context: current)
+        }
+        current.connection.betterPathUpdateHandler = { [weak self, weak current] better in
+            guard let self = self, let current = current else { return }
+            self.handleEvent(.shouldReconnect(better), context: current)
+        }
+        current.connection.start(queue: queue)
+        readLoop(current)
+    }
+
+    internal func handleEvent(_ event: ConnectionState, context current: EventContext) {
+        withCurrent(current) { delegate?.connectionChanged(state: event) }
+    }
+
+    internal func handleState(_ state: NWConnection.State, context current: EventContext) {
+        withCurrent(current) {
+            let event: ConnectionState
+            switch state {
+            case .ready:
+                writeContextLock.lock(); writeContext = current; writeContextLock.unlock()
+                event = .connected
+            case .waiting(let error):
+                invalidateWriteContext(current)
+                if case .posix(.ETIMEDOUT) = error { event = .timeout }
+                else { event = .waiting(error: error) }
+            case .cancelled:
+                invalidateWriteContext(current); event = .cancelled
+            case .failed(let error):
+                invalidateWriteContext(current); event = .failed(error)
+            case .setup, .preparing: return
+            @unknown default: return
+            }
+            // eventLock still protects admission, but context lock is released
+            // before any engine callback can acquire its writer semaphore.
+            delegate?.connectionChanged(state: event)
+        }
+    }
+
+    private func invalidateWriteContext(_ current: EventContext) {
+        writeContextLock.lock()
+        if writeContext === current { writeContext = nil }
+        writeContextLock.unlock()
+    }
+
+    private func readLoop(_ current: EventContext) {
+        withCurrent(current) {
+            let receive: (Data?, Bool, NWError?) -> Void = { [weak self, weak current] data, final, error in
+                guard let self = self, let current = current else { return }
+                self.handleRead(data: data, isFinal: final, error: error, context: current)
+            }
+            if let receiveOverride = receiveOverride { receiveOverride(current.connection, receive) }
+            else {
+                current.connection.receive(minimumIncompleteLength: 2, maximumLength: 4096) { data, context, complete, error in
+                    receive(data, context?.isFinal == true && complete, error)
+                }
+            }
+        }
+    }
+
+    internal func handleRead(data: Data?, isFinal: Bool, error: NWError?, context current: EventContext) {
+        withCurrent(current) {
+            if let data = data { delegate?.connectionChanged(state: .receive(data)) }
+            // A delegate may retire/reconnect recursively. Recheck identity
+            // before scheduling another receive, always on this same socket.
+            if !isFinal && error == nil { readLoop(current) }
+        }
+    }
+
+    internal final class TLSCompletion {
+        private let lock = NSLock()
+        private var completion: ((Bool) -> Void)?
+        init(_ completion: @escaping (Bool) -> Void) { self.completion = completion }
+        func finish(_ accepted: Bool) { resolve { accepted } }
+        func resolve(_ decision: () -> Bool) {
+            lock.lock(); let callback = completion; completion = nil; lock.unlock()
+            guard let callback = callback else { return }
+            callback(decision())
+        }
+    }
+
+    internal func finishVerification(_ state: PinningState, generation: ConnectionGeneration, completion: TLSCompletion) {
+        completion.resolve {
+            var accepted = false
+            withConnectionEvents {
+                guard context?.generation === generation, generation.isCurrent else { return }
+                switch state {
+                case .success: accepted = true
+                case .failed(let error): delegate?.connectionChanged(state: .failed(error))
+                }
+            }
+            return accepted
+        }
+        // Resolve OS verification exactly once even after retirement. Never
+        // leave the old TLS handshake pending or let it fail the new engine.
     }
 }
 #else

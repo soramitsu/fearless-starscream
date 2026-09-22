@@ -30,7 +30,12 @@ let package = Package(
         dependencies: [],
         targets: [
             .target(name: "Starscream",
-                    path: "Sources")
+                    path: "Sources"),
+            .testTarget(name: "AuthorizedWriteTests", dependencies: ["Starscream"],
+                        path: "Tests/AuthorizedWriteTests"),
+            .testTarget(name: "LegacyRegressionTests", dependencies: ["Starscream"],
+                        path: "Tests", exclude: ["AuthorizedWriteTests", "StarscreamTests", "Info.plist"],
+                        sources: ["CompressionTests.swift", "FuzzingTests.swift", "MockServer.swift", "MockTransport.swift"])
         ]
 )
 

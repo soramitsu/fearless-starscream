@@ -76,11 +76,21 @@ extension FoundationSecurity: CertificatePinning {
 
 extension FoundationSecurity: HeaderValidator {
     public func validate(headers: [String: String], key: String) -> Error? {
-        if let acceptKey = headers[HTTPWSHeader.acceptName] {
-            let sha = "\(key)258EAFA5-E914-47DA-95CA-C5AB0DC85B11".sha1Base64()
-            if sha != acceptKey {
-                return WSError(type: .securityError, message: "accept header doesn't match", code: SecurityErrorCode.acceptFailed.rawValue)
-            }
+        // HTTP field names are case-insensitive. A missing or ambiguous
+        // accept header must never establish a WebSocket connection.
+        func field(_ name: String) -> String? {
+            let values = headers.filter { $0.key.caseInsensitiveCompare(name) == .orderedSame }
+            guard values.count == 1 else { return nil }
+            return values.first?.value.trimmingCharacters(in: .whitespaces)
+        }
+        let expected = "\(key)258EAFA5-E914-47DA-95CA-C5AB0DC85B11".sha1Base64()
+        let connectionTokens = field(HTTPWSHeader.connectionName)?.split(separator: ",").map {
+            $0.trimmingCharacters(in: .whitespaces).lowercased()
+        } ?? []
+        guard field(HTTPWSHeader.acceptName) == expected,
+              field(HTTPWSHeader.upgradeName)?.lowercased() == HTTPWSHeader.upgradeValue,
+              connectionTokens.contains("upgrade") else {
+            return WSError(type: .securityError, message: "invalid WebSocket upgrade response", code: SecurityErrorCode.acceptFailed.rawValue)
         }
         return nil
     }
