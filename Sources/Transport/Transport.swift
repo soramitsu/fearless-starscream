@@ -54,3 +54,32 @@ public protocol Transport: AnyObject {
     func write(data: Data, completion: @escaping ((Error?) -> ()))
     var usingTLS: Bool { get }
 }
+
+/// Callback admission and connection lifecycle share this outer serialization
+/// domain. Writers must never acquire it while holding engine/context locks.
+internal protocol ConnectionEventSerializing: AnyObject {
+    func withConnectionEvents(_ action: () -> Void)
+}
+
+internal final class ConnectionGeneration {
+    private let lock = NSLock()
+    private var current = true
+    private var open = true
+    var isCurrent: Bool { lock.lock(); defer { lock.unlock() }; return current }
+    func retire() { lock.lock(); current = false; open = false; lock.unlock() }
+    func close() { lock.lock(); open = false; lock.unlock() }
+    func allowsDelivery(isTerminal: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return current && (open || isTerminal)
+    }
+}
+
+internal protocol ConnectionStateResetting {
+    func resetForNewConnection()
+}
+
+/// Control frames prepared for an old socket must never close its replacement.
+internal protocol ConnectionBoundTransport: Transport {
+    func captureWriteContext() -> AnyObject?
+    func writeConnectionBound(data: Data, context: AnyObject, completion: @escaping (Error?) -> Void)
+}

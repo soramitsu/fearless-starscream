@@ -22,7 +22,7 @@
 
 import Foundation
 
-public class StringHTTPHandler: HTTPHandler {
+public class StringHTTPHandler: HTTPHandler, ConnectionStateResetting {
     
     var buffer = Data()
     weak var delegate: HTTPHandlerDelegate?
@@ -30,6 +30,8 @@ public class StringHTTPHandler: HTTPHandler {
     public init() {
         
     }
+
+    internal func resetForNewConnection() { buffer = Data() }
     
     public func convert(request: URLRequest) -> Data {
         guard let url = request.url else {
@@ -140,4 +142,3 @@ public class StringHTTPHandler: HTTPHandler {
         return -1
     }
 }
-

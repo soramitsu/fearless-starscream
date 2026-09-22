@@ -111,7 +111,7 @@ public protocol WebSocketDelegate: AnyObject {
     func didReceive(event: WebSocketEvent, client: WebSocketClient)
 }
 
-open class WebSocket: WebSocketClient, EngineDelegate {
+open class WebSocket: WebSocketClient, EngineDelegate, ConnectionGenerationDelegate {
     public let engine: Engine
     public weak var delegate: WebSocketDelegate?
     public var onEvent: ((WebSocketEvent) -> Void)?
@@ -188,6 +188,21 @@ open class WebSocket: WebSocketClient, EngineDelegate {
             guard let s = self else { return }
             s.delegate?.didReceive(event: event, client: s)
             s.onEvent?(event)
+        }
+    }
+
+    internal func didReceive(event: WebSocketEvent, generation: ConnectionGeneration) {
+        let terminal: Bool
+        switch event {
+        case .disconnected, .error, .cancelled, .timeout, .waiting: terminal = true
+        default: terminal = false
+        }
+        callbackQueue.async { [weak self] in
+            // This is callback admission, not retroactive withdrawal: a
+            // delegate already executing before retirement may finish.
+            guard let socket = self, generation.allowsDelivery(isTerminal: terminal) else { return }
+            socket.delegate?.didReceive(event: event, client: socket)
+            socket.onEvent?(event)
         }
     }
 }

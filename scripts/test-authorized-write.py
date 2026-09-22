@@ -9,8 +9,8 @@ sys.stdout.write(result.stdout)
 if result.returncode:
     sys.exit(result.returncode)
 passed = re.findall(r"^Test Case (.+) passed \(", result.stdout, re.MULTILINE)
-if len(passed) != 38 or len(set(passed)) != 38:
-    sys.exit('Expected exactly 38 distinct passing XCTest cases')
+if len(passed) != 59 or len(set(passed)) != 59:
+    sys.exit('Expected exactly 59 distinct passing XCTest cases')
 if re.search(r"^Test Case .+ (?:failed|skipped) \(", result.stdout, re.MULTILINE):
     sys.exit('Failed or skipped qualification case')
-print('PASS: 38 distinct tests; no skipped or failed cases')
+print('PASS: 59 distinct tests; no skipped or failed cases')

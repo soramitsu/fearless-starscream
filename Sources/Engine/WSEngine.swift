@@ -24,11 +24,15 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     private let writeQueue = DispatchQueue(label: "com.vluxe.starscream.writequeue")
     private let mutex = DispatchSemaphore(value: 1)
     private var canSend = false
+    private var isStopping = false
     private var authorizedConnectionEpoch = UUID()
     private var authorizedCanSend = false
     private let authorizedWritesLock = NSLock()
     private var authorizedWritesStopped = true
     private var authorizedWrites = [UUID: AuthorizedWrite]()
+    private var eventGeneration = ConnectionGeneration()
+    private var connectionActive = false
+    private var connectionCallbacks: ConnectionCallbacks?
     
     weak var delegate: EngineDelegate?
     public var respondToPingWithPong: Bool = true
@@ -54,17 +58,31 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     }
     
     public func start(request: URLRequest) {
+        withConnectionEvents { startSerialized(request: request) }
+    }
+
+    private func startSerialized(request: URLRequest) {
         mutex.wait()
-        let isConnected = canSend
+        let isConnected = canSend && !isStopping
+        let stopping = isStopping
         mutex.signal()
         if isConnected {
             return
         }
-        
+        if stopping { forceStopSerialized() }
+        eventGeneration.retire()
+        eventGeneration = ConnectionGeneration()
+        connectionActive = true
+        reset()
+        frameHandler.reset()
+        (framer as? ConnectionStateResetting)?.resetForNewConnection()
+        (httpHandler as? ConnectionStateResetting)?.resetForNewConnection()
+        let callbacks = ConnectionCallbacks(engine: self, generation: eventGeneration)
+        connectionCallbacks = callbacks
         self.request = request
         transport.register(delegate: self)
-        framer.register(delegate: self)
-        httpHandler.register(delegate: self)
+        framer.register(delegate: callbacks)
+        httpHandler.register(delegate: callbacks)
         frameHandler.delegate = self
         guard let url = request.url else {
             return
@@ -73,20 +91,71 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     }
     
     public func stop(closeCode: UInt16 = CloseCode.normal.rawValue) {
+        withConnectionEvents { stopSerialized(closeCode: closeCode) }
+    }
+
+    private func stopSerialized(closeCode: UInt16) {
         invalidateAuthorizedWrites()
+        // A delayed handshake/frame must not reopen mutation admission while
+        // the close frame is queued or waiting for transport completion.
+        connectionActive = false
+        eventGeneration.close()
+        connectionCallbacks = nil
+        mutex.wait()
+        let connected = canSend
+        isStopping = connected
+        mutex.signal()
+        // A pre-handshake socket cannot write a close frame. Retire it now so
+        // the next start actually creates a fresh physical connection.
+        guard connected else { forceStopSerialized(); return }
+        let generation = eventGeneration
         let capacity = MemoryLayout<UInt16>.size
         var pointer = [UInt8](repeating: 0, count: capacity)
         writeUint16(&pointer, offset: 0, value: closeCode)
         let payload = Data(bytes: pointer, count: MemoryLayout<UInt16>.size)
-        write(data: payload, opcode: .connectionClose, completion: { [weak self] in
-            self?.reset()
-            self?.forceStop()
-        })
+        let completion: () -> Void = { [weak self] in
+            guard let engine = self else { return }
+            engine.withConnectionEvents {
+                guard engine.eventGeneration === generation else { return }
+                engine.forceStopSerialized()
+            }
+        }
+        if let bound = transport as? ConnectionBoundTransport {
+            guard let context = bound.captureWriteContext() else { forceStopSerialized(); return }
+            writeQueue.async { [weak self] in
+                guard let engine = self else { return }
+                // Control frames are uncompressed; denial must not advance a
+                // shared compressor. Context is checked after frame creation.
+                let frame = engine.framer.createWriteFrame(opcode: .connectionClose, payload: payload, isCompressed: false)
+                bound.writeConnectionBound(data: frame, context: context) { _ in completion() }
+            }
+        } else {
+            write(data: payload, opcode: .connectionClose, completion: completion)
+        }
     }
     
     public func forceStop() {
+        withConnectionEvents { forceStopSerialized() }
+    }
+
+    private func forceStopSerialized() {
         invalidateAuthorizedWrites()
+        // Revoke parser admission immediately. The delivery token remains
+        // current until replacement so an admitted terminal error/disconnect
+        // can still notify the client of this session's failure.
+        connectionActive = false
+        eventGeneration.close()
+        connectionCallbacks = nil
+        reset()
         transport.disconnect()
+    }
+
+    private func withConnectionEvents(_ action: () -> Void) {
+        if let serializing = transport as? ConnectionEventSerializing {
+            serializing.withConnectionEvents(action)
+        } else {
+            action()
+        }
     }
     
     public func write(string: String, completion: (() -> ())?) {
@@ -205,6 +274,10 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     // MARK: - TransportEventClient
     
     public func connectionChanged(state: ConnectionState) {
+        withConnectionEvents { connectionChangedSerialized(state: state) }
+    }
+
+    private func connectionChangedSerialized(state: ConnectionState) {
         switch state {
         case .connected:
             secKeyValue = HTTPWSHeader.generateWebSocketKey()
@@ -242,6 +315,11 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     // MARK: - HTTPHandlerDelegate
     
     public func didReceiveHTTP(event: HTTPEvent) {
+        withConnectionEvents { didReceiveHTTPSerialized(event: event) }
+    }
+
+    private func didReceiveHTTPSerialized(event: HTTPEvent) {
+        guard connectionActive else { return }
         switch event {
         case .success(let headers):
             if let error = headerChecker.validate(headers: headers, key: secKeyValue) {
@@ -274,6 +352,11 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     // MARK: - FramerEventClient
     
     public func frameProcessed(event: FrameEvent) {
+        withConnectionEvents { frameProcessedSerialized(event: event) }
+    }
+
+    private func frameProcessedSerialized(event: FrameEvent) {
+        guard connectionActive else { return }
         switch event {
         case .frame(let frame):
             frameHandler.add(frame: frame)
@@ -289,6 +372,10 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     }
     
     public func didForm(event: FrameCollector.Event) {
+        withConnectionEvents { didFormSerialized(event: event) }
+    }
+
+    private func didFormSerialized(event: FrameCollector.Event) {
         switch event {
         case .text(let string):
             broadcast(event: .text(string))
@@ -310,7 +397,34 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     }
     
     private func broadcast(event: WebSocketEvent) {
-        delegate?.didReceive(event: event)
+        if let delegate = delegate as? ConnectionGenerationDelegate {
+            delegate.didReceive(event: event, generation: eventGeneration)
+        } else {
+            delegate?.didReceive(event: event)
+        }
+    }
+
+    private final class ConnectionCallbacks: FramerEventClient, HTTPHandlerDelegate {
+        private weak var engine: WSEngine?
+        private let generation: ConnectionGeneration
+        init(engine: WSEngine, generation: ConnectionGeneration) {
+            self.engine = engine
+            self.generation = generation
+        }
+        func frameProcessed(event: FrameEvent) {
+            guard let engine = engine else { return }
+            engine.withConnectionEvents {
+                guard engine.connectionActive, engine.eventGeneration === generation else { return }
+                engine.frameProcessedSerialized(event: event)
+            }
+        }
+        func didReceiveHTTP(event: HTTPEvent) {
+            guard let engine = engine else { return }
+            engine.withConnectionEvents {
+                guard engine.connectionActive, engine.eventGeneration === generation else { return }
+                engine.didReceiveHTTPSerialized(event: event)
+            }
+        }
     }
     
     //This call can be coming from a lot of different queues/threads.
@@ -322,7 +436,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
             stop()
         }
         
-        delegate?.didReceive(event: .error(error))
+        broadcast(event: .error(error))
     }
     
     private func reset() {
@@ -330,6 +444,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
         authorizedConnectionEpoch = UUID()
         authorizedCanSend = false
         canSend = false
+        isStopping = false
         didUpgrade = false
         mutex.signal()
     }
